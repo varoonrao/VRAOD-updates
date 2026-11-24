@@ -1,0 +1,100 @@
+name: Build and publish VRAOD
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Native APK and UI, or UI only
+        type: choice
+        options: [native, ui]
+        default: native
+      notes:
+        description: Release notes
+        type: string
+        default: Interface and functionality improvements.
+  push:
+    branches: [main]
+    paths: ['VRAOD-v6-Android.zip', '.github/workflows/build-apk.yml', 'app/**', 'scripts/**']
+permissions:
+  contents: read
+concurrency:
+  group: vraod-release
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      VRAOD_OTA_REPO: ${{ vars.VRAOD_OTA_REPO }}
+      MODE: ${{ inputs.mode || 'ui' }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prepare source
+        run: |
+          if [ -f VRAOD-v6-Android.zip ]; then
+            unzip -o VRAOD-v6-Android.zip -d source
+            echo "PROJECT_DIR=source/VRAOD" >> "$GITHUB_ENV"
+          else
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+          fi
+      - name: Sign UI release and embed public key
+        env:
+          OTA_KEY: ${{ secrets.VRAOD_OTA_PRIVATE_KEY }}
+          NOTES: ${{ inputs.notes || 'Interface and functionality improvements.' }}
+        run: |
+          set -euo pipefail
+          test -n "$OTA_KEY" && test -n "$VRAOD_OTA_REPO" || { echo 'Configure OTA secrets and repository variable first'; exit 1; }
+          umask 077
+          KEY="$RUNNER_TEMP/vraod-ota.pem"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s' "$OTA_KEY" | base64 --decode > "$KEY"
+          python3 "$PROJECT_DIR/scripts/package-update.py" --project "$PROJECT_DIR" --key "$KEY" --repo "$VRAOD_OTA_REPO" --out "$RUNNER_TEMP/vraod-update.json" --notes "$NOTES"
+      - uses: actions/setup-java@v5
+        if: env.MODE == 'native'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4.0.4
+        if: env.MODE == 'native'
+        with:
+          packages: platform-tools platforms;android-35 build-tools;35.0.0
+      - uses: gradle/actions/setup-gradle@v6
+        if: env.MODE == 'native'
+        with:
+          gradle-version: '8.9'
+      - name: Bundle fonts
+        if: env.MODE == 'native'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p app/src/main/assets/fonts
+          BASE=https://raw.githubusercontent.com/google/fonts/main/ofl
+          curl -fL --retry 3 "$BASE/michroma/Michroma-Regular.ttf" -o app/src/main/assets/fonts/Michroma-Regular.ttf
+          curl -fL --retry 3 "$BASE/michroma/OFL.txt" -o app/src/main/assets/fonts/Michroma-OFL.txt
+          for weight in Regular Medium SemiBold Bold; do
+            curl -fL --retry 3 "$BASE/encodesansexpanded/EncodeSansExpanded-$weight.ttf" -o "app/src/main/assets/fonts/EncodeSansExpanded-$weight.ttf"
+          done
+          curl -fL --retry 3 "$BASE/encodesansexpanded/OFL.txt" -o app/src/main/assets/fonts/EncodeSansExpanded-OFL.txt
+      - name: Build permanently signed APK
+        if: env.MODE == 'native'
+        env:
+          APK_KEY: ${{ secrets.VRAOD_APK_KEYSTORE }}
+          VRAOD_STORE_PASSWORD: ${{ secrets.VRAOD_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$APK_KEY" && test -n "$VRAOD_STORE_PASSWORD" || { echo 'APK signing secrets missing'; exit 1; }
+          umask 077
+          export VRAOD_KEYSTORE="$RUNNER_TEMP/vraod.p12"
+          trap 'rm -f "$VRAOD_KEYSTORE"' EXIT
+          printf '%s' "$APK_KEY" | base64 --decode > "$VRAOD_KEYSTORE"
+          gradle -p "$PROJECT_DIR" assembleDebug --no-daemon
+          cp "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" VRAOD.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs VRAOD.apk
+      - uses: actions/upload-artifact@v6
+        if: env.MODE == 'native'
+        with:
+          name: VRAOD-APK
+          path: VRAOD.apk
+          if-no-files-found: error
+      - name: Publish signed UI
+        if: env.MODE == 'ui'
+        env:
+          VRAOD_PUBLISH_TOKEN: ${{ secrets.VRAOD_PUBLISH_TOKEN }}
+        run: python3 "$PROJECT_DIR/scripts/publish-update.py" "$RUNNER_TEMP/vraod-update.json"
